@@ -87,6 +87,7 @@ contract IncoEventContract is GatewayCaller, Ownable {
     ) internal {
         // Get deterministic key using values
         bytes32 tokenKey = getDeterministicKey(uint256(chainId), senderContract, tokenId);
+
         // Derive eaddress
         einput actualEInput = einput.wrap(einputForAddress);
         eaddress holderAddress = TFHE.asEaddress(actualEInput, inputProof);
@@ -204,10 +205,10 @@ contract IncoEventContract is GatewayCaller, Ownable {
 
     function setInterchainSecurityModule()
         public
-        onlyContractOrNull(0xBa045a7dB294ED800CEDe4F1d0a8De47CC5c4c95)
+        onlyContractOrNull(0x10F222A26bDa86abdAadd87f3Ba4ca0efE9C8dC3)
         onlyOwner
     {
-        interchainSecurityModule = IInterchainSecurityModule(0xBa045a7dB294ED800CEDe4F1d0a8De47CC5c4c95);
+        interchainSecurityModule = IInterchainSecurityModule(0x10F222A26bDa86abdAadd87f3Ba4ca0efE9C8dC3);
     }
 
     modifier onlyContractOrNull(address _contract) {
