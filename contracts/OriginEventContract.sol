@@ -1,202 +1,150 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.0;
 
-import "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
+import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-contract OriginEventContract is Ownable {
-    
-    uint256 public tokenId;
-    address public paymentToken; // Address of USDC or other accepted currency
-    IMailbox public mailBox; // Hyperlane message router
-    address public incoContractAddress;
-    uint32 public constant incoDomain = 21097; // Destination chain domain
-    string public tokenUri;
-    uint256 public raffleAmount; // Amount reserved for raffle
-    uint256 public cost;
-
-    struct TokenPurchase {
-        bytes32 actualEInput; // Encrypted input provided by the user
-        uint256 amount; // Amount of tokens purchased
+contract BettingGame is ERC721, Ownable {
+    struct Bet {
+        uint256 amount; // Maximum betting amount
+        string hostTwitter; // Host's Twitter handle
+        bytes encryptedKey; // Encrypted key
+        address host; // Address of the host
+        bool active; // Whether the bet is active
+        uint256 endTime; // The bet will be closed on this time
+        string url;
     }
 
-    // tokenId => actualEInput => amount
-    mapping(uint256 => mapping(bytes32 => uint256))
-        public tokenIdToAddressToAmount;
-    mapping(uint256 => uint256) public tokenIdToToAmount;
-
-    function setIncoContract(address _newIncoContractAddress) external{
-        incoContractAddress = _newIncoContractAddress;
+    struct UsersHistoricalBets {
+        uint256 amount;
+        address userAddress;
+        string emailAddress;
+        string twitter;
     }
 
-    event TokenPurchased(
-        address indexed buyer,
-        uint256 indexed tokenId,
-        bytes32 actualEInput,
-        bytes inputProof,
-        uint256 amount
-    );
+    address public agentAddress;
 
-    constructor(
-        address _paymentToken,
-        address _mailBoxAddress,
-        uint256 _raffleAmount,
-        address _incoContractAddress,
-        uint256 _cost
-    ) Ownable(msg.sender) {
-        paymentToken = _paymentToken;
-        mailBox = IMailbox(_mailBoxAddress);
-        tokenUri = "uri";
-        raffleAmount = _raffleAmount; // Initialize the raffle amount
-        incoContractAddress = _incoContractAddress;
-        cost = _cost;
+    uint256 public betCounter = 0;
+    mapping(uint256 => Bet) public bets;
+    mapping(uint256 => UsersHistoricalBets[]) public userBets; // Multiple bets per bet ID
+
+    event BetCreated(uint256 betId, uint256 amount, string hostTwitter, address host);
+    event BetActivated(uint256 betId, string tokenURI);
+    event BetPlaced(uint256 betId, address bettor, string bettorTwitter, string bettorEmail);
+    event BetClosed(uint256 betId, address winner, string winnerTwitter, string winnerEmail, uint256 actualAmount);
+
+    modifier onlyAgent() {
+        require(msg.sender == agentAddress, "Only the agent can call this function");
+        _;
     }
 
-    /**
-     * @dev User purchases a token by providing an encrypted input and proof.
-     */
-    function purchaseToken(
-        bytes32 actualEInput,
-        bytes memory inputProof,
-        uint256 amount
-    ) external payable {
-        // Verify user has given approval and sufficient balance
-        require(
-            IERC20(paymentToken).allowance(msg.sender, address(this)) >= cost * amount,
-            "Insufficient allowance"
+    constructor(address _agentAddress) ERC721("BetNFT", "BFT") Ownable(msg.sender) {
+        agentAddress = _agentAddress;
+    }
+
+    // Host a new bet
+    function hostBet(
+        uint256 amount,
+        uint256 timeToEnd,
+        string memory hostTwitter,
+        bytes memory encryptedKey
+    ) public payable {
+        require(msg.value >= amount, "Insufficient ETH for hosting the bet");
+        require(timeToEnd > block.timestamp, "End time must be in the future");
+
+        bets[betCounter] = Bet({
+            amount: amount,
+            hostTwitter: hostTwitter,
+            encryptedKey: encryptedKey,
+            host: msg.sender,
+            active: false, // Bet is not active until secured
+            endTime: timeToEnd,
+            url: ""
+        });
+
+        emit BetCreated(betCounter, amount, hostTwitter, msg.sender);
+
+        betCounter++;
+    }
+
+    // Secure a bet: Mint NFT with URI from the AI agent and activate the bet
+    function secureBet(uint256 betId, string memory tokenURI) external onlyOwner {
+        Bet storage bet = bets[betId];
+        require(!bet.active, "Bet is already active");
+
+        // Mint NFT to the contract address to ensure ownership
+        _safeMint(address(this), betId);
+
+        bet.active = true;
+        bet.url = tokenURI;
+
+        emit BetActivated(betId, tokenURI);
+    }
+
+    // Place a bet
+    function placeBet(uint256 betId, string memory bettorTwitter, string memory bettorEmail) public payable {
+        Bet storage bet = bets[betId];
+        require(bet.active, "Bet is not active");
+        require(msg.value > 0, "Must place a bet with ETH");
+        require(block.timestamp < bet.endTime, "Betting time has expired");
+
+        userBets[betId].push(
+            UsersHistoricalBets({
+                amount: msg.value,
+                userAddress: msg.sender,
+                emailAddress: bettorEmail,
+                twitter: bettorTwitter
+            })
         );
 
-        // Transfer payment tokens from the user to the contract
-        IERC20(paymentToken).transferFrom(msg.sender, address(this), cost * amount);
-
-        // Store actualEInput in mapping
-        tokenIdToAddressToAmount[tokenId][actualEInput] = amount;
-
-        // Emit purchase event
-        emit TokenPurchased(
-            msg.sender,
-            tokenId,
-            actualEInput,
-            inputProof,
-            amount
-        );
-        tokenId++;
-
-        // Prepare message for Hyperlane
-        bytes memory message = abi.encode(
-            msg.sender,
-            tokenId,
-            actualEInput,
-            inputProof,
-            amount
-        );
-
-        // Send message to Inco chain
-        uint256 fee = mailBox.quoteDispatch(
-            incoDomain,
-            addressToBytes32(incoContractAddress),
-            message
-        );
-        mailBox.dispatch{value: fee}(
-            incoDomain,
-            addressToBytes32(incoContractAddress),
-            message
-        );
+        emit BetPlaced(betId, msg.sender, bettorTwitter, bettorEmail);
     }
 
-    /**
-     * @dev Allows the owner to update the raffle amount.
-     * @param newRaffleAmount The new amount reserved for the raffle.
-     */
-    function updateRaffleAmount(uint256 newRaffleAmount) external onlyOwner {
-        raffleAmount = newRaffleAmount;
+    // Close the bet when the agent provides the actual amount
+    function closeBetWhenTimeEnds(uint256 betId, uint256 actualAmount) public onlyAgent {
+        Bet storage bet = bets[betId];
+        require(bet.active, "Bet is already closed or inactive");
+        require(block.timestamp >= bet.endTime, "Betting period is not over");
+
+        // Determine the winner with the closest bet
+        address winner;
+        string memory winnerTwitter;
+        string memory winnerEmail;
+        uint256 closestDifference = type(uint256).max;
+
+        for (uint256 i = 0; i < userBets[betId].length; i++) {
+            UsersHistoricalBets memory userBet = userBets[betId][i];
+            uint256 difference = actualAmount > userBet.amount
+                ? actualAmount - userBet.amount
+                : userBet.amount - actualAmount;
+
+            if (difference < closestDifference) {
+                closestDifference = difference;
+                winner = userBet.userAddress;
+                winnerTwitter = userBet.twitter;
+                winnerEmail = userBet.emailAddress;
+            }
+        }
+
+        require(winner != address(0), "No valid bets placed");
+
+        bet.active = false;
+
+        // Transfer NFT to the winner
+        safeTransferFrom(address(this), winner, betId);
+        payable(winner).transfer(bet.amount);
+
+        // Calculate and distribute funds
+        uint256 totalFunds = address(this).balance;
+        uint256 platformFee = (totalFunds * 10) / 100;
+        uint256 profit = totalFunds - bet.amount - platformFee;
+
+        if (profit > 0) {
+            payable(bet.host).transfer(profit);
+        }
+
+        payable(owner()).transfer(platformFee);
+
+        emit BetClosed(betId, winner, winnerTwitter, winnerEmail, actualAmount);
     }
-
-    // alignment preserving cast
-    function bytes32ToAddress(bytes32 _buf) internal pure returns (address) {
-        return address(uint160(uint256(_buf)));
-    }
-
-    // alignment preserving cast
-    function addressToBytes32(address _addr) internal pure returns (bytes32) {
-        return bytes32(uint256(uint160(_addr)));
-    }
-}
-
-interface IMailbox {
-    // ============ Events ============
-    /**
-     * @notice Emitted when a new message is dispatched via Hyperlane
-     * @param sender The address that dispatched the message
-     * @param destination The destination domain of the message
-     * @param recipient The message recipient address on `destination`
-     * @param message Raw bytes of message
-     */
-    event Dispatch(
-        address indexed sender,
-        uint32 indexed destination,
-        bytes32 indexed recipient,
-        bytes message
-    );
-
-    /**
-     * @notice Emitted when a new message is dispatched via Hyperlane
-     * @param messageId The unique message identifier
-     */
-    event DispatchId(bytes32 indexed messageId);
-
-    /**
-     * @notice Emitted when a Hyperlane message is processed
-     * @param messageId The unique message identifier
-     */
-    event ProcessId(bytes32 indexed messageId);
-
-    /**
-     * @notice Emitted when a Hyperlane message is delivered
-     * @param origin The origin domain of the message
-     * @param sender The message sender address on `origin`
-     * @param recipient The address that handled the message
-     */
-    event Process(
-        uint32 indexed origin,
-        bytes32 indexed sender,
-        address indexed recipient
-    );
-
-    function localDomain() external view returns (uint32);
-
-    function delivered(bytes32 messageId) external view returns (bool);
-
-    function latestDispatchedId() external view returns (bytes32);
-
-    function dispatch(
-        uint32 destinationDomain,
-        bytes32 recipientAddress,
-        bytes calldata messageBody
-    ) external payable returns (bytes32 messageId);
-
-    function quoteDispatch(
-        uint32 destinationDomain,
-        bytes32 recipientAddress,
-        bytes calldata messageBody
-    ) external view returns (uint256 fee);
-
-    function dispatch(
-        uint32 destinationDomain,
-        bytes32 recipientAddress,
-        bytes calldata body,
-        bytes calldata defaultHookMetadata
-    ) external payable returns (bytes32 messageId);
-
-    function quoteDispatch(
-        uint32 destinationDomain,
-        bytes32 recipientAddress,
-        bytes calldata messageBody,
-        bytes calldata defaultHookMetadata
-    ) external view returns (uint256 fee);
-
-    function process(bytes calldata metadata, bytes calldata message)
-        external
-        payable;
 }
